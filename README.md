@@ -73,7 +73,7 @@ A missing required value is an error at start.
 | `--audience` | `COMIN_HOOK_AUDIENCE` | none, required | Audience that tokens must carry |
 | `--subject` | `COMIN_HOOK_SUBJECT` | none, at least one | Accepted `sub` value, repeatable |
 | `--claim` | `COMIN_HOOK_CLAIM` | none | Extra string claim as `key=value`, repeatable |
-| `--comin-socket` | `COMIN_HOOK_COMIN_SOCKET` | `/var/lib/comin/grpc.sock` | gRPC unix socket of comin |
+| `--comin-socket` | `COMIN_HOOK_COMIN_SOCKET` | `/run/comin-grpc.sock` | gRPC unix socket of comin |
 
 In the environment, a repeatable flag takes comma-separated values.
 A `--subject` is an exact match.
@@ -125,7 +125,7 @@ With `funnel.enable`, the unit also runs `publish` before it starts and `unpubli
 | `services.comin-hook.audience` | str | none, required | Audience that tokens must carry |
 | `services.comin-hook.subjects` | list of str | `[ ]`, at least one | Accepted `sub` values |
 | `services.comin-hook.claims` | attrs of str | `{ }` | Extra claims with their required values |
-| `services.comin-hook.cominSocket` | path | `"/var/lib/comin/grpc.sock"` | gRPC unix socket of comin |
+| `services.comin-hook.cominSocket` | path | `"/run/comin-grpc.sock"` | gRPC unix socket of comin |
 | `services.comin-hook.cominSocketGroup` | null or str | `null` | Group to join, when the group of the socket limits access |
 | `services.comin-hook.funnel.enable` | bool | `false` | Publish the receiver with Tailscale Funnel |
 | `services.comin-hook.funnel.port` | 443, 8443 or 10000 | `443` | HTTPS port of Funnel |

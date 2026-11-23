@@ -19,7 +19,7 @@ const (
 	DefaultListen           = "127.0.0.1:8371"
 	DefaultPath             = "/deploy"
 	DefaultIssuer           = "https://token.actions.githubusercontent.com"
-	DefaultCominSocket      = "/var/lib/comin/grpc.sock"
+	DefaultCominSocket      = "/run/comin-grpc.sock"
 	DefaultTailscaledSocket = "/var/run/tailscale/tailscaled.sock"
 	DefaultFunnelPort       = 443
 )

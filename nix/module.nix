@@ -116,7 +116,7 @@ in
 
     cominSocket = lib.mkOption {
       type = lib.types.path;
-      default = "/var/lib/comin/grpc.sock";
+      default = "/run/comin-grpc.sock";
       description = "The path of the gRPC unix socket of comin.";
     };
 
