@@ -52,10 +52,24 @@ linters:
           files:
             - $all
             - "!$test"
+            # internal/testissuer is test support: it signs tokens with
+            # go-jose, which the program itself does not import.
+            - "!**/internal/testissuer/**"
           allow:
             - $gostd
             - github.com/victor-software-house/comin-hook$
             - github.com/victor-software-house/comin-hook/
+            # Verify a CI job's OIDC token.
+            - github.com/coreos/go-oidc/v3/oidc$
+            # Call comin's gRPC API over its unix socket.
+            - github.com/nlewo/comin/pkg/protobuf$
+            - google.golang.org/grpc$
+            - google.golang.org/grpc/credentials/insecure$
+            - google.golang.org/protobuf/types/known/emptypb$
+            # Publish through the host's tailscaled.
+            - tailscale.com/client/local$
+            - tailscale.com/ipn$
+            - tailscale.com/ipn/ipnstate$
         json-v1:
           # The trailing $ matches only v1, so encoding/json/v2 and
           # encoding/json/jsontext stay allowed.
