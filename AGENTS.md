@@ -6,7 +6,8 @@ See [README.md](./README.md) for what it does and how to run it.
 ## Rules
 
 1. **The repository is public.**
-   Keep every deployment-specific value out of tracked files, commit messages, branch names and pull-request text: tailnet names, host names, IP addresses, organization or repository IDs, names of private repositories, and descriptions of private infrastructure.
+   Keep every deployment-specific value out of tracked files, commit messages, branch names and pull-request text.
+   That covers tailnet names, host names, IP addresses, organization or repository IDs, names of private repositories, and descriptions of private infrastructure.
    A deployment value is a flag, an environment variable or a NixOS option.
    Examples use `example.com` and `example-org/example-repo`.
 2. **Go layout.**
@@ -16,7 +17,7 @@ See [README.md](./README.md) for what it does and how to run it.
 3. **No new dependency without a reason.**
    Approve a module by adding it to the depguard `allow` list in the pull request that adds it to `go.mod`.
 4. **Tests are table tests compared with go-cmp.**
-5. **CI, tasks and hooks come from the templates repository.**
+5. **CI, tasks and hooks come from a shared template.**
    Change them through a template update, never by hand-writing a workflow.
 6. **Commits and pull requests.**
    Conventional Commits, one pull request per change, branch names `<type>/<short-topic>`.
