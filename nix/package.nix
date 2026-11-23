@@ -32,6 +32,7 @@ buildGoModule {
   meta = {
     description = "Trigger a comin fetch from CI with an OIDC token";
     mainProgram = "comin-hook";
+    license = lib.licenses.agpl3Only;
     platforms = [
       "x86_64-linux"
       "aarch64-linux"
