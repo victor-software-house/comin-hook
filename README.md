@@ -203,3 +203,7 @@ GitHub documents the other `sub` formats, such as those for an environment or a 
 
 `mise run go:verify` runs the offline checks.
 `nix build` builds the package and runs the tests in its check phase.
+
+## License
+
+comin-hook is licensed under the [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`).
