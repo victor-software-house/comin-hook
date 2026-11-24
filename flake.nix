@@ -74,11 +74,75 @@
               }
             ];
           };
+          pkgs = nixpkgs.legacyPackages.${system};
+          inherit (nixpkgs) lib;
+
+          # Runs a jq program of the Funnel unit on every fixture of its
+          # directory, and compares the output with the .expected file.
+          funnelPrograms =
+            pkgs.runCommand "comin-hook-funnel-programs" { nativeBuildInputs = [ pkgs.jq ]; }
+              ''
+                failed=0
+                count=0
+                run() {
+                  program=$1
+                  dir=$2
+                  shift 2
+                  for fixture in "$dir"/*.json; do
+                    expected="''${fixture%.json}.expected"
+                    actual=$(jq --raw-output "$@" --from-file "$program" "$fixture")
+                    count=$((count + 1))
+                    if [ "$actual" != "$(cat "$expected")" ]; then
+                      echo "FAIL $fixture: got '$actual', want '$(cat "$expected")'" >&2
+                      failed=1
+                    fi
+                  done
+                }
+                run ${./nix/funnel-preflight.jq} ${./nix/fixtures/funnel-preflight} --arg port 443 --arg path /hook/x
+                run ${./nix/funnel-check.jq} ${./nix/fixtures/funnel-check} \
+                  --arg port 443 --arg path /hook/x --arg target 'http://[::1]:8371/hook/x'
+                run ${./nix/funnel-ready.jq} ${./nix/fixtures/funnel-ready}
+                echo "$count fixtures"
+                [ "$count" -ge 20 ] && [ "$failed" = 0 ]
+                touch $out
+              '';
+
+          # The path option takes only a clean absolute path.
+          pathCheck = host.options.services.comin-hook.path.type.check;
+          goodPaths = [
+            "/deploy"
+            "/a/b"
+            "/.well-known/x"
+            "/a.b"
+            "/a~b_c-d"
+            "/..a"
+            "/.a"
+            "/a."
+          ];
+          badPaths = [
+            ""
+            "/"
+            "/a/"
+            "//a"
+            "/a//b"
+            "/.."
+            "/."
+            "/a/../b"
+            "/a/./b"
+            "/a?b"
+            "/a#b"
+            "/a b"
+            "/a%2e"
+            "deploy"
+          ];
         in
+        assert lib.all pathCheck goodPaths;
+        assert lib.all (path: !pathCheck path) badPaths;
         {
-          module = nixpkgs.legacyPackages.${system}.writeText "comin-hook-module-check" (
+          module = pkgs.writeText "comin-hook-module-check" (
             builtins.unsafeDiscardStringContext host.config.system.build.toplevel.drvPath
           );
+          funnel-programs = funnelPrograms;
         }
       );
 

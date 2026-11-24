@@ -26,19 +26,55 @@ let
     "--set-path=${cfg.path}"
   ];
 
+  funnelPort = toString cfg.funnel.port;
+  jq = lib.getExe pkgs.jq;
+  sleep = "${pkgs.coreutils}/bin/sleep";
+
+  # The jq programs are files, so the flake checks run them against fixtures.
+  #
+  # Funnel can start only once the node is on the tailnet. Before the first
+  # network map, the node lacks the capabilities that the CLI reads, and the
+  # CLI then exits 0 without changing anything. The wait ends before
+  # TimeoutStartSec.
+  funnelWait = pkgs.writeShellScript "comin-hook-funnel-wait" ''
+    set -euo pipefail
+    while [ "$SECONDS" -lt 40 ]; do
+      if ${tailscale} status --json | ${jq} --exit-status --from-file ${./funnel-ready.jq} > /dev/null 2>&1; then
+        exit 0
+      fi
+      ${sleep} 1
+    done
+    echo "tailscaled has not joined the tailnet yet" >&2
+    exit 1
+  '';
+
+  # Funnel applies to a whole host and port, so it stops when the port serves
+  # anything besides the receiver, which Funnel would publish too.
+  funnelPreflight = pkgs.writeShellScript "comin-hook-funnel-preflight" ''
+    set -euo pipefail
+    problems=$(${tailscale} serve status --json | ${jq} --raw-output \
+      --arg port ${funnelPort} \
+      --arg path ${lib.escapeShellArg cfg.path} \
+      --from-file ${./funnel-preflight.jq})
+    if [ -n "$problems" ]; then
+      echo "Funnel would publish more than the receiver on port ${funnelPort}:" >&2
+      echo "$problems" >&2
+      echo "Move the other handlers to another port, or set another services.comin-hook.funnel.port." >&2
+      exit 1
+    fi
+  '';
+
   # The tailscale CLI exits 0 without changing anything when the node lacks the
   # funnel attribute, so a start succeeds only when the serve configuration
   # shows Funnel on for the port, with a proxy handler for the receiver.
   funnelCheck = pkgs.writeShellScript "comin-hook-funnel-check" ''
     set -euo pipefail
-    if ! ${tailscale} serve status --json | ${lib.getExe pkgs.jq} --exit-status \
-      --arg port ":${toString cfg.funnel.port}" \
+    if ! ${tailscale} serve status --json | ${jq} --exit-status \
+      --arg port ${funnelPort} \
       --arg path ${lib.escapeShellArg cfg.path} \
       --arg target ${lib.escapeShellArg funnelTarget} \
-      '. as $config
-        | [($config.AllowFunnel // {}) | to_entries[] | select(.value == true and (.key | endswith($port))) | .key]
-        | any(.[]; (($config.Web // {})[.].Handlers // {})[$path].Proxy == $target)' > /dev/null; then
-      echo "Funnel is not on for port ${toString cfg.funnel.port} with a handler at ${cfg.path}" >&2
+      --from-file ${./funnel-check.jq} > /dev/null; then
+      echo "Funnel is not on for port ${funnelPort} with a handler at ${cfg.path}" >&2
       echo "Check that the node has the funnel attribute and that HTTPS is enabled for the tailnet." >&2
       exit 1
     fi
@@ -93,9 +129,13 @@ in
     };
 
     path = lib.mkOption {
-      type = lib.types.strMatching "/[^/]+(/[^/]+)*";
+      type = lib.types.strMatching "(/([A-Za-z0-9_~-]|\\.[A-Za-z0-9_~-]|\\.\\.[A-Za-z0-9._~-])[A-Za-z0-9._~-]*)+";
       default = "/deploy";
-      description = "The one request path the receiver accepts, with no trailing slash and no empty segment.";
+      description = ''
+        The one request path the receiver accepts.
+        Each segment has letters, digits and the characters . _ ~ -, and is neither . nor ..
+        The path has no trailing slash and no empty segment.
+      '';
     };
 
     issuer = lib.mkOption {
@@ -247,6 +287,14 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
         TimeoutStartSec = 60;
+        # A start can fail before the node has its network map, and a oneshot
+        # unit does not start again by itself.
+        Restart = "on-failure";
+        RestartSec = "10s";
+        ExecStartPre = [
+          funnelWait
+          funnelPreflight
+        ];
         ExecStart = utils.escapeSystemdExecArgs (
           [
             tailscale
@@ -258,6 +306,9 @@ in
           ++ [ funnelTarget ]
         );
         ExecStartPost = funnelCheck;
+        # "serve ... off" removes the handler, and Funnel with it when no
+        # handler remains on the port. Unlike "funnel ... off", it does not
+        # check the funnel attribute first, so it works on a node that lost it.
         # "-" ignores a failure, so a stop with tailscaled down or with no
         # handler left leaves no failed unit.
         ExecStop =
@@ -265,7 +316,7 @@ in
           + utils.escapeSystemdExecArgs (
             [
               tailscale
-              "funnel"
+              "serve"
             ]
             ++ funnelArgs
             ++ [ "off" ]

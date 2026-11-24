@@ -51,7 +51,7 @@ The receiver verifies the token itself, with the standard library.
    - `aud` is a string, or a list, that contains `--audience`.
    - `exp` is present and in the future.
    - `nbf` and `iat`, when present, are at most 60 seconds in the future.
-   - `jti` is a non-empty string, and `sub` is a string.
+   - `jti` and `sub` are non-empty strings.
 
 ## Threat model
 
@@ -115,7 +115,17 @@ The module reads the gRPC socket and its group from the `services.comin.grpc` op
 
 With `funnel.enable`, it adds `comin-hook-funnel.service`, which needs `services.tailscale.enable`.
 That unit is a oneshot that stays active, and it stops with `comin-hook.service`.
-It starts after `tailscaled.service` and runs:
+It starts after `tailscaled.service`, and starts again every 10 seconds after a failure.
+
+Before it publishes anything, the unit runs two checks:
+
+1. It waits up to 40 seconds until `tailscale status --json` shows `BackendState` `Running` and a DNS name for the node.
+   Before the first network map, the node lacks the funnel attribute, and the CLI exits 0 without changing anything.
+2. It reads `tailscale serve status --json` and fails with a message when the port serves anything besides the receiver.
+   Funnel applies to a whole host and port, so another handler on the port would become public too.
+   The check fails for a handler at another path, for a TCP forward, for plain HTTP and for TLS-terminated TCP on the port.
+
+Then it runs:
 
 ```sh
 tailscale funnel --bg --yes --https=<port> --set-path=<path> http://<listen><path>
@@ -123,12 +133,17 @@ tailscale funnel --bg --yes --https=<port> --set-path=<path> http://<listen><pat
 
 The proxy target repeats the path, because tailscaled strips the mount point from the request path.
 
-When the command returns, the unit checks `tailscale serve status --json`.
+When the command returns, the unit checks `tailscale serve status --json` again.
 It fails unless Funnel is on for the port and a proxy handler at the path points at the receiver.
 The check is needed because the tailscale CLI exits 0 without changing anything when the node lacks the funnel attribute.
 
-Stopping the unit runs `tailscale funnel --https=<port> --set-path=<path> off`, and ignores a failure of that command.
-A stop with tailscaled down, or with no handler left, therefore leaves no failed unit.
+Stopping the unit runs `tailscale serve --https=<port> --set-path=<path> off`, and ignores a failure of that command.
+That command removes the handler, and Funnel with it when no handler remains on the port.
+
+Unlike `tailscale funnel ... off`, it does not check the funnel attribute first, so it also works on a node that lost the attribute.
+A stop with tailscaled down, or with no handler left, leaves no failed unit.
+
+The jq programs of these checks are files in `nix/`, and `nix flake check` runs them against the JSON fixtures in `nix/fixtures/`.
 
 Funnel needs HTTPS enabled for the tailnet and the `funnel` node attribute for the host.
 The public URL is `https://<node DNS name>:<funnel port><path>`, without the port part for 443.
@@ -139,7 +154,7 @@ The public URL is `https://<node DNS name>:<funnel port><path>`, without the por
 | `services.comin-hook.package` | package | the flake package | The program to run |
 | `services.comin-hook.listenAddress` | str | `"127.0.0.1"` | Address to listen on |
 | `services.comin-hook.port` | port | `8371` | TCP port to listen on |
-| `services.comin-hook.path` | str | `"/deploy"` | The one request path, with no trailing slash and no empty segment |
+| `services.comin-hook.path` | str | `"/deploy"` | The one request path: segments of letters, digits and `. _ ~ -`, never `.` or `..`, with no trailing slash |
 | `services.comin-hook.issuer` | str | `"https://token.actions.githubusercontent.com"` | OIDC issuer, an https URL |
 | `services.comin-hook.audience` | str | none, required | Audience that tokens must carry |
 | `services.comin-hook.subjects` | list of str | `[ ]`, at least one | Accepted `sub` values |
