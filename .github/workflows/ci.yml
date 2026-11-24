@@ -5,6 +5,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
+  # A daily run reports a new advisory against the unchanged default branch.
+  schedule:
+    - cron: "37 8 * * *"
 
 # Each job declares the permissions it needs.
 permissions:
@@ -129,7 +132,7 @@ jobs:
       ${{ !cancelled() && !github.event.pull_request.draft
       && needs.changes.outputs.build != 'false' }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 23
+    timeout-minutes: 31
     outputs:
       cache-saved: >-
         ${{ steps.cache_save.outcome == 'success' }}
@@ -195,6 +198,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: mise run go:verify
+      - name: Run go:vuln
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise run go:vuln
       # Only a run on the default branch saves.
       # A pull request, a merge group and a run on another branch restore and
       # never write. No entry that another run restores therefore comes from
