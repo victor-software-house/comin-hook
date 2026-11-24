@@ -14,7 +14,7 @@ buildGoModule {
     ];
   };
 
-  vendorHash = "sha256-OpfnzJXE0Cr2Zg5o55vhIPfTsJp+wR2SsSHUub1Jpy4=";
+  vendorHash = "sha256-uPqabZgQGQulf+F3BvMLhv4O0h5jOq12F7K60u5xjtA=";
 
   subPackages = [ "cmd/comin-hook" ];
 
