@@ -1,4 +1,4 @@
-// Package config reads the settings of each subcommand from flags, with a
+// Package config reads the settings of the serve subcommand from flags, with a
 // COMIN_HOOK_* environment variable as the fallback for each flag.
 package config
 
@@ -16,16 +16,11 @@ import (
 
 // Defaults of the flags that have one.
 const (
-	DefaultListen           = "127.0.0.1:8371"
-	DefaultPath             = "/deploy"
-	DefaultIssuer           = "https://token.actions.githubusercontent.com"
-	DefaultCominSocket      = "/run/comin-grpc.sock"
-	DefaultTailscaledSocket = "/var/run/tailscale/tailscaled.sock"
-	DefaultFunnelPort       = 443
+	DefaultListen      = "127.0.0.1:8371"
+	DefaultPath        = "/deploy"
+	DefaultIssuer      = "https://token.actions.githubusercontent.com"
+	DefaultCominSocket = "/run/comin-grpc.sock"
 )
-
-// funnelPorts are the ports Tailscale Funnel accepts.
-var funnelPorts = []uint16{443, 8443, 10000}
 
 // Serve is the configuration of the serve subcommand.
 type Serve struct {
@@ -36,14 +31,6 @@ type Serve struct {
 	Subjects    []string
 	Claims      map[string]string
 	CominSocket string
-}
-
-// Funnel is the configuration of the publish and unpublish subcommands.
-type Funnel struct {
-	Listen           string
-	Path             string
-	FunnelPort       uint16
-	TailscaledSocket string
 }
 
 // ParseServe reads the serve flags from args and the environment from getenv.
@@ -97,42 +84,6 @@ func (s Serve) validate() error {
 		return fmt.Errorf("--comin-socket must be an absolute path, got %q", s.CominSocket)
 	}
 	return nil
-}
-
-// ParseFunnel reads the publish and unpublish flags from args and the
-// environment from getenv.
-func ParseFunnel(name string, args []string, getenv func(string) string) (Funnel, error) {
-	var (
-		f    Funnel
-		port int
-	)
-	fs := newFlagSet(name)
-	fs.StringVar(&f.Listen, "listen", DefaultListen, "address the receiver listens on, which Funnel proxies to")
-	fs.StringVar(&f.Path, "path", DefaultPath, "request path the receiver accepts, which Funnel serves")
-	fs.IntVar(&port, "funnel-port", DefaultFunnelPort, "HTTPS port Funnel listens on: 443, 8443 or 10000")
-	fs.StringVar(&f.TailscaledSocket, "tailscaled-socket", DefaultTailscaledSocket, "path of tailscaled's unix socket")
-	if err := parse(fs, args, getenv); err != nil {
-		return Funnel{}, err
-	}
-
-	if err := validateListen(f.Listen); err != nil {
-		return Funnel{}, err
-	}
-	if host, _, _ := net.SplitHostPort(f.Listen); host == "" {
-		return Funnel{}, fmt.Errorf("--listen needs a host for Funnel to proxy to, got %q", f.Listen)
-	}
-	if err := validatePath(f.Path); err != nil {
-		return Funnel{}, err
-	}
-	for _, allowed := range funnelPorts {
-		if int(allowed) == port {
-			f.FunnelPort = allowed
-		}
-	}
-	if f.FunnelPort == 0 {
-		return Funnel{}, fmt.Errorf("--funnel-port must be 443, 8443 or 10000, got %d", port)
-	}
-	return f, nil
 }
 
 func validateListen(listen string) error {

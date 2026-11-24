@@ -1,0 +1,1 @@
+{"TCP":{"443":{"HTTPS":true}},"Web":{"h.example.ts.net:443":{"Handlers":{"/hook/x":{"Proxy":"http://[::1]:8371/hook/x"},"/admin":{"Proxy":"http://127.0.0.1:9000"}}}}}

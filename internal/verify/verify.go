@@ -1,16 +1,28 @@
 // Package verify checks a CI job's OIDC token and decides whether its holder
 // may trigger a fetch.
+//
+// It reads the issuer's discovery document and signing keys with the standard
+// library, and accepts only RS256 tokens.
 package verify
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"math/big"
 	"net/http"
+	"net/url"
 	"slices"
+	"strings"
+	"sync"
 	"time"
-
-	"github.com/coreos/go-oidc/v3/oidc"
 )
 
 // ErrUnauthenticated marks a token that is not a valid token of the issuer
@@ -20,8 +32,34 @@ var ErrUnauthenticated = errors.New("unauthenticated")
 // ErrForbidden marks a valid token whose subject or claims are not allowed.
 var ErrForbidden = errors.New("forbidden")
 
-// httpTimeout bounds each request to the issuer's discovery and key endpoints.
-const httpTimeout = 10 * time.Second
+// Limits of the requests to the issuer and of the tokens.
+const (
+	// httpTimeout bounds each request to the issuer's discovery and key endpoints.
+	httpTimeout = 10 * time.Second
+	// maxBodyBytes bounds the body of the issuer's responses.
+	maxBodyBytes = 1 << 20
+	// maxTokenBytes bounds the length of a token.
+	maxTokenBytes = 8 << 10
+	// minRefetchInterval is the shortest time between two fetches of the key
+	// set, whatever causes them.
+	minRefetchInterval = time.Minute
+	// maxKeyAge is how long a loaded key set stays trusted. After that, the
+	// next verification loads it again, so a key that the issuer dropped stops
+	// verifying.
+	maxKeyAge = time.Hour
+	// maxStaleGrace is how long past maxKeyAge a set that cannot be loaded
+	// again still serves. The receiver fails closed after that, which costs
+	// speed and not a deploy, since comin polls its repository on its own.
+	maxStaleGrace = 24 * time.Hour
+	// timeLeeway is how far in the future an nbf or iat claim may be.
+	timeLeeway = time.Minute
+	// maxNumericDate bounds the seconds of a date claim, so that converting
+	// it to a time cannot overflow.
+	maxNumericDate = 1 << 40
+)
+
+// algRS256 is the one signing algorithm the verifier accepts.
+const algRS256 = "RS256"
 
 // Identity is what a verified token shows about its holder.
 type Identity struct {
@@ -37,43 +75,368 @@ type Identity struct {
 
 // Verifier checks tokens of one issuer for one audience.
 type Verifier struct {
-	idTokens *oidc.IDTokenVerifier
+	issuer   string
+	audience string
+	jwksURL  string
+	client   *http.Client
+	now      func() time.Time
+
+	// mu guards the fields below. It is never held during a request.
+	mu        sync.Mutex
+	keys      map[string]*rsa.PublicKey
+	loadedAt  time.Time
+	lastFetch time.Time
 }
 
-// New discovers the issuer's configuration and returns a verifier that
-// accepts RS256 tokens for audience. The issuer's signing keys are fetched
-// when needed and cached by their remote key set, until ctx ends.
+// New discovers the issuer's configuration, loads its signing keys, and
+// returns a verifier that accepts RS256 tokens for audience.
+// ctx bounds only this start.
+// Afterwards, the verifier fetches the key set again when a token has an
+// unknown key ID, and when the loaded set is an hour old.
+// It fetches at most once a minute across all requests.
+// When the fetch of an old set fails, it keeps the old keys for 24 hours more.
+// After that, it rejects every token until a fetch works.
 func New(ctx context.Context, issuer, audience string) (*Verifier, error) {
-	ctx = oidc.ClientContext(ctx, &http.Client{Timeout: httpTimeout})
-	provider, err := oidc.NewProvider(ctx, issuer)
-	if err != nil {
+	client := &http.Client{
+		Timeout: httpTimeout,
+		// A redirect could lead from https to another scheme.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return newVerifier(ctx, issuer, audience, client, time.Now)
+}
+
+func newVerifier(
+	ctx context.Context,
+	issuer, audience string,
+	client *http.Client,
+	now func() time.Time,
+) (*Verifier, error) {
+	v := &Verifier{issuer: issuer, audience: audience, client: client, now: now}
+
+	var doc struct {
+		Issuer  string `json:"issuer"`
+		JWKSURI string `json:"jwks_uri"`
+	}
+	if err := v.getJSON(ctx, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", &doc); err != nil {
 		return nil, fmt.Errorf("discovering OIDC issuer %s: %w", issuer, err)
 	}
-	return &Verifier{idTokens: provider.Verifier(&oidc.Config{
-		ClientID:             audience,
-		SupportedSigningAlgs: []string{oidc.RS256},
-	})}, nil
+	if doc.Issuer != issuer {
+		return nil, fmt.Errorf("discovering OIDC issuer %s: the document names issuer %q", issuer, doc.Issuer)
+	}
+	jwksURL, err := url.Parse(doc.JWKSURI)
+	if err != nil || jwksURL.Scheme != "https" || jwksURL.Host == "" {
+		return nil, fmt.Errorf("discovering OIDC issuer %s: jwks_uri %q is not an https URL", issuer, doc.JWKSURI)
+	}
+	v.jwksURL = jwksURL.String()
+
+	// This first load does not count toward the refetch interval, so the
+	// first unknown key ID can still fetch.
+	if v.keys, err = v.fetchKeys(ctx); err != nil {
+		return nil, fmt.Errorf("loading the keys of OIDC issuer %s: %w", issuer, err)
+	}
+	v.loadedAt = now()
+	return v, nil
 }
 
-// Verify checks the signature, issuer, audience and expiry of raw. A token
-// with no expiry or no jti is refused, since a replay could not be told apart.
-func (v *Verifier) Verify(ctx context.Context, raw string) (Identity, error) {
-	token, err := v.idTokens.Verify(ctx, raw)
+// getJSON decodes the JSON body of a successful GET response into out.
+func (v *Verifier) getJSON(ctx context.Context, target string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
 	if err != nil {
-		return Identity{}, fmt.Errorf("%w: %w", ErrUnauthenticated, err)
+		return fmt.Errorf("building request: %w", err)
 	}
-	var claims map[string]any
-	if err := token.Claims(&claims); err != nil {
-		return Identity{}, fmt.Errorf("%w: reading claims: %w", ErrUnauthenticated, err)
+	resp, err := v.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetching: %w", err)
 	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("fetching %s: status %d", target, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", target, err)
+	}
+	if len(body) > maxBodyBytes {
+		return fmt.Errorf("reading %s: the body exceeds %d bytes", target, maxBodyBytes)
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("decoding %s: %w", target, err)
+	}
+	return nil
+}
+
+// webKey is a key of a key set, with the members the verifier reads.
+type webKey struct {
+	Kty string `json:"kty"`
+	Use string `json:"use"`
+	Kid string `json:"kid"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+// publicKey decodes the public key of k.
+func (k webKey) publicKey() (*rsa.PublicKey, error) {
+	n, err := base64.RawURLEncoding.DecodeString(k.N)
+	if err != nil {
+		return nil, fmt.Errorf("decoding n: %w", err)
+	}
+	e, err := base64.RawURLEncoding.DecodeString(k.E)
+	if err != nil {
+		return nil, fmt.Errorf("decoding e: %w", err)
+	}
+	exponent := new(big.Int).SetBytes(e)
+	if !exponent.IsInt64() || exponent.Int64() < 2 || exponent.Int64() > math.MaxInt32 {
+		return nil, errors.New("the exponent is out of range")
+	}
+	return &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(exponent.Int64())}, nil
+}
+
+// fetchKeys returns the signature keys of the issuer by key ID.
+// It skips keys of another type or use, and keys that cannot be decoded, so
+// one bad entry does not block the others. It fails when no key is left.
+func (v *Verifier) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey, error) {
+	var set struct {
+		Keys []webKey `json:"keys"`
+	}
+	if err := v.getJSON(ctx, v.jwksURL, &set); err != nil {
+		return nil, err
+	}
+	keys := make(map[string]*rsa.PublicKey, len(set.Keys))
+	var skipped []error
+	for _, k := range set.Keys {
+		if k.Kty != "RSA" || (k.Use != "sig" && k.Use != "") || k.Kid == "" {
+			continue
+		}
+		key, err := k.publicKey()
+		if err != nil {
+			skipped = append(skipped, fmt.Errorf("key %q: %w", k.Kid, err))
+			continue
+		}
+		keys[k.Kid] = key
+	}
+	if len(keys) == 0 {
+		empty := errors.New("the key set has no usable RSA signature key")
+		return nil, errors.Join(append([]error{empty}, skipped...)...)
+	}
+	return keys, nil
+}
+
+// key returns the key with the given ID.
+// The key set is fetched again in two cases.
+// Either the ID is unknown, or the key set is older than maxKeyAge.
+// A fetch within the last minute blocks both.
+// For an old set, a failed or blocked fetch keeps the old keys.
+// An outage of the issuer then does not reject tokens that are still valid.
+// That holds for maxStaleGrace past maxKeyAge. After that, a set that could
+// not be loaded again is stale, and every token is rejected until a load works.
+func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+	v.mu.Lock()
+	known, found := v.keys[kid]
+	now := v.now()
+	age := now.Sub(v.loadedAt)
+	if found && age < maxKeyAge {
+		v.mu.Unlock()
+		return known, nil
+	}
+	stale := age >= maxKeyAge+maxStaleGrace
+	if !v.lastFetch.IsZero() && now.Sub(v.lastFetch) < minRefetchInterval {
+		v.mu.Unlock()
+		return v.withoutFetch(known, found, stale)
+	}
+	// Stamp the attempt before the request, so that concurrent requests and
+	// a failing issuer both wait out the interval.
+	v.lastFetch = now
+	v.mu.Unlock()
+
+	// The reload serves every request, so a client that leaves must not cancel
+	// it. The client of the verifier bounds it with its timeout.
+	keys, err := v.fetchKeys(context.WithoutCancel(ctx))
+	if err != nil {
+		if key, keyErr := v.withoutFetch(known, found, stale); keyErr == nil {
+			return key, nil
+		}
+		if stale {
+			return nil, fmt.Errorf("%w: key set is stale: fetching the keys: %w", ErrUnauthenticated, err)
+		}
+		return nil, fmt.Errorf("%w: fetching the keys: %w", ErrUnauthenticated, err)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.keys = keys
+	v.loadedAt = v.now()
+	key, ok := keys[kid]
+	if !ok {
+		return nil, reject("unknown key id")
+	}
+	return key, nil
+}
+
+// withoutFetch answers for a request that has no fresh key set.
+// An old set serves its known keys until it is stale.
+func (v *Verifier) withoutFetch(known *rsa.PublicKey, found, stale bool) (*rsa.PublicKey, error) {
+	switch {
+	case stale:
+		return nil, reject("key set is stale")
+	case found:
+		return known, nil
+	default:
+		return nil, reject("unknown key id")
+	}
+}
+
+// reject returns an error wrapping ErrUnauthenticated.
+// The reason is a fixed string, so it never contains a part of the token.
+func reject(reason string) error {
+	return fmt.Errorf("%w: %s", ErrUnauthenticated, reason)
+}
+
+// token is a parsed JWT whose signature is not checked yet.
+type token struct {
+	kid          string
+	signingInput string
+	signature    []byte
+	claims       map[string]any
+}
+
+// parseToken splits and decodes raw, and accepts only the RS256 algorithm and
+// a token with a key ID. It does not check the signature or the claims.
+func parseToken(raw string) (token, error) {
+	if len(raw) > maxTokenBytes {
+		return token{}, reject("token is too long")
+	}
+	header, rest, ok := strings.Cut(raw, ".")
+	if !ok {
+		return token{}, reject("token is not three parts")
+	}
+	payload, signature, ok := strings.Cut(rest, ".")
+	if !ok || strings.Contains(signature, ".") {
+		return token{}, reject("token is not three parts")
+	}
+
+	var tok token
+	headerJSON, err := base64.RawURLEncoding.DecodeString(header)
+	if err != nil {
+		return token{}, reject("token header is not base64url")
+	}
+	payloadJSON, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return token{}, reject("token payload is not base64url")
+	}
+	if tok.signature, err = base64.RawURLEncoding.DecodeString(signature); err != nil {
+		return token{}, reject("token signature is not base64url")
+	}
+
+	var head struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerJSON, &head); err != nil {
+		return token{}, reject("token header is not valid JSON")
+	}
+	if head.Alg != algRS256 {
+		return token{}, reject("token algorithm is not RS256")
+	}
+	if head.Kid == "" {
+		return token{}, reject("token has no key id")
+	}
+	if err := json.Unmarshal(payloadJSON, &tok.claims); err != nil || tok.claims == nil {
+		return token{}, reject("token payload is not a JSON object")
+	}
+	tok.kid = head.Kid
+	tok.signingInput = header + "." + payload
+	return tok, nil
+}
+
+// Verify checks the signature, issuer, audience and times of raw. A token
+// with no expiry, no jti or no subject is refused, since a replay could not
+// be told apart.
+func (v *Verifier) Verify(ctx context.Context, raw string) (Identity, error) {
+	tok, err := parseToken(raw)
+	if err != nil {
+		return Identity{}, err
+	}
+	key, err := v.key(ctx, tok.kid)
+	if err != nil {
+		return Identity{}, err
+	}
+	digest := sha256.Sum256([]byte(tok.signingInput))
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], tok.signature); err != nil {
+		return Identity{}, reject("bad signature")
+	}
+	return v.checkClaims(tok.claims, v.now())
+}
+
+func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Identity, error) {
+	if iss, _ := claims["iss"].(string); iss != v.issuer {
+		return Identity{}, reject("wrong issuer")
+	}
+	if !v.hasAudience(claims["aud"]) {
+		return Identity{}, reject("wrong audience")
+	}
+
+	rawExp, ok := claims["exp"]
+	if !ok {
+		return Identity{}, reject("token has no exp")
+	}
+	expiry, ok := numericDate(rawExp)
+	if !ok {
+		return Identity{}, reject("exp is not a date")
+	}
+	if !now.Before(expiry) {
+		return Identity{}, reject("token is expired")
+	}
+	for _, name := range []string{"nbf", "iat"} {
+		raw, present := claims[name]
+		if !present {
+			continue
+		}
+		at, ok := numericDate(raw)
+		if !ok {
+			return Identity{}, reject(name + " is not a date")
+		}
+		if at.After(now.Add(timeLeeway)) {
+			return Identity{}, reject(name + " is in the future")
+		}
+	}
+
 	id, _ := claims["jti"].(string)
 	if id == "" {
-		return Identity{}, fmt.Errorf("%w: token has no jti", ErrUnauthenticated)
+		return Identity{}, reject("token has no jti")
 	}
-	if token.Expiry.IsZero() {
-		return Identity{}, fmt.Errorf("%w: token has no exp", ErrUnauthenticated)
+	subject, ok := claims["sub"].(string)
+	if !ok {
+		return Identity{}, reject("sub is not a string")
 	}
-	return Identity{Subject: token.Subject, ID: id, Expiry: token.Expiry, Claims: claims}, nil
+	if subject == "" {
+		return Identity{}, reject("sub is empty")
+	}
+	return Identity{Subject: subject, ID: id, Expiry: expiry, Claims: claims}, nil
+}
+
+// hasAudience reports whether the aud claim, a string or a list of strings,
+// contains the audience of the verifier.
+func (v *Verifier) hasAudience(aud any) bool {
+	switch aud := aud.(type) {
+	case string:
+		return aud == v.audience
+	case []any:
+		return slices.ContainsFunc(aud, func(item any) bool {
+			s, ok := item.(string)
+			return ok && s == v.audience
+		})
+	default:
+		return false
+	}
+}
+
+// numericDate converts a JSON number of seconds since the epoch to a time.
+func numericDate(raw any) (time.Time, bool) {
+	seconds, ok := raw.(float64)
+	if !ok || math.IsNaN(seconds) || math.Abs(seconds) > maxNumericDate {
+		return time.Time{}, false
+	}
+	whole, fraction := math.Modf(seconds)
+	return time.Unix(int64(whole), int64(fraction*float64(time.Second))), true
 }
 
 // Policy lists which verified tokens may trigger a fetch.

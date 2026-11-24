@@ -1,8 +1,6 @@
 // Command comin-hook lets a CI job trigger a fetch in comin on this host.
 //
-// The serve subcommand receives the CI job's request. The publish and
-// unpublish subcommands add the receiver to, and remove it from, the host's
-// Tailscale Funnel configuration.
+// The serve subcommand receives the CI job's request.
 package main
 
 import (
@@ -19,7 +17,6 @@ import (
 
 	"github.com/victor-software-house/comin-hook/internal/comin"
 	"github.com/victor-software-house/comin-hook/internal/config"
-	"github.com/victor-software-house/comin-hook/internal/funnel"
 	"github.com/victor-software-house/comin-hook/internal/server"
 	"github.com/victor-software-house/comin-hook/internal/verify"
 )
@@ -28,7 +25,7 @@ import (
 // write timeout, so a slow comin gives a 502 instead of a dropped connection.
 const fetchTimeout = 5 * time.Second
 
-const usage = "usage: comin-hook <serve|publish|unpublish> [flags]"
+const usage = "usage: comin-hook serve [flags]"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -45,25 +42,16 @@ func run(ctx context.Context) error {
 		return errors.New(usage)
 	}
 	command, args := os.Args[1], os.Args[2:]
-
-	var err error
-	switch command {
-	case "serve":
-		err = serveCommand(ctx, args)
-	case "publish":
-		err = funnelCommand(ctx, command, args, funnel.Publish)
-	case "unpublish":
-		err = funnelCommand(ctx, command, args, funnel.Unpublish)
-	default:
+	if command != "serve" {
 		return fmt.Errorf("unknown command %q\n%s", command, usage)
 	}
-	if errors.Is(err, flag.ErrHelp) {
-		return nil
+	if err := serve(ctx, args); !errors.Is(err, flag.ErrHelp) {
+		return err
 	}
-	return err
+	return nil
 }
 
-func serveCommand(ctx context.Context, args []string) (err error) {
+func serve(ctx context.Context, args []string) (err error) {
 	cfg, err := config.ParseServe(args, os.Getenv)
 	if err != nil {
 		return err
@@ -96,22 +84,4 @@ func serveCommand(ctx context.Context, args []string) (err error) {
 		Now:      time.Now,
 	})
 	return server.Run(ctx, ln, handler, log)
-}
-
-func funnelCommand(
-	ctx context.Context,
-	name string,
-	args []string,
-	act func(context.Context, funnel.Options) error,
-) error {
-	cfg, err := config.ParseFunnel(name, args, os.Getenv)
-	if err != nil {
-		return err
-	}
-	return act(ctx, funnel.Options{
-		Listen: cfg.Listen,
-		Path:   cfg.Path,
-		Port:   cfg.FunnelPort,
-		Socket: cfg.TailscaledSocket,
-	})
 }
