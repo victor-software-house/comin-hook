@@ -52,6 +52,15 @@ func TestSeen(t *testing.T) {
 			wantHeld: 2,
 		},
 		{
+			name: "an id is expired at the instant of its expiry",
+			steps: []step{
+				{at: 0, id: "a", expiry: time.Minute, want: false},
+				{at: time.Minute - time.Nanosecond, id: "a", expiry: time.Hour, want: true},
+				{at: time.Minute, id: "a", expiry: time.Hour, want: false},
+			},
+			wantHeld: 1,
+		},
+		{
 			name: "expired entries are pruned",
 			steps: []step{
 				{at: 0, id: "a", expiry: time.Minute, want: false},
@@ -77,4 +86,27 @@ func TestSeen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRelease(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	set := New(func() time.Time { return now })
+	expiry := now.Add(time.Hour)
+
+	if set.Seen("a", expiry) {
+		t.Fatal("a new id was reported as seen")
+	}
+	set.Release("a")
+	if set.Len() != 0 {
+		t.Errorf("Len after Release = %d, want 0", set.Len())
+	}
+	if set.Seen("a", expiry) {
+		t.Error("a released id was reported as seen")
+	}
+	if !set.Seen("a", expiry) {
+		t.Error("a reserved id was reported as new")
+	}
+	set.Release("unknown")
 }

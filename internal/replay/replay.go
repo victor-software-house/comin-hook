@@ -1,4 +1,6 @@
 // Package replay remembers token IDs until the tokens expire.
+// A caller reserves an ID before it acts on a token.
+// It releases the ID when the action failed, so the same token may try again.
 package replay
 
 import (
@@ -23,8 +25,8 @@ func New(now func() time.Time) *Set {
 	return &Set{now: now, seen: make(map[string]time.Time), nextPrune: now().Add(pruneInterval)}
 }
 
-// Seen records id until expiry and reports whether it was already recorded
-// and had not expired.
+// Seen reserves id until expiry and reports whether it was already reserved
+// and had not expired. An entry is expired at the instant of its expiry.
 func (s *Set) Seen(id string, expiry time.Time) bool {
 	now := s.now()
 
@@ -44,6 +46,13 @@ func (s *Set) Seen(id string, expiry time.Time) bool {
 	}
 	s.seen[id] = expiry
 	return false
+}
+
+// Release drops the reservation of id, so that Seen reports it as new again.
+func (s *Set) Release(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.seen, id)
 }
 
 // Len is the number of entries stored.
