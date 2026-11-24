@@ -224,3 +224,105 @@ func TestHandler(t *testing.T) {
 		})
 	}
 }
+
+// ctxFetcher fails with the error of the context it gets, like a real call
+// that the request would cancel.
+type ctxFetcher struct{ calls atomic.Int32 }
+
+func (c *ctxFetcher) Fetch(ctx context.Context) error {
+	c.calls.Add(1)
+	return ctx.Err()
+}
+
+func newTestHandler(fetcher server.Fetcher, logs *strings.Builder) *server.Handler {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	return server.NewHandler(server.Options{
+		Path: hookPath,
+		Verifier: stubVerifier{"good": {
+			Subject: subject,
+			ID:      "jti-1",
+			Expiry:  now.Add(10 * time.Minute),
+			Claims:  map[string]any{},
+		}},
+		Policy:  verify.Policy{Subjects: []string{subject}},
+		Fetcher: fetcher,
+		Logger:  slog.New(slog.NewTextHandler(logs, nil)),
+		Now:     func() time.Time { return now },
+	})
+}
+
+func TestHandlerFetchSurvivesClientLeaving(t *testing.T) {
+	t.Parallel()
+
+	var logs strings.Builder
+	fetcher := &ctxFetcher{}
+	handler := newTestHandler(fetcher, &logs)
+
+	// The client is gone before the call to comin starts.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	send := func(ctx context.Context) int {
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, hookPath, http.NoBody)
+		req.Header.Set("Authorization", "Bearer good")
+		got := httptest.NewRecorder()
+		handler.ServeHTTP(got, req)
+		return got.Code
+	}
+
+	if got := send(ctx); got != http.StatusAccepted {
+		t.Errorf("status after the client left = %d, want %d", got, http.StatusAccepted)
+	}
+	// comin got the call, so the same token must not run it again.
+	if got := send(t.Context()); got != http.StatusConflict {
+		t.Errorf("status of the same token again = %d, want %d", got, http.StatusConflict)
+	}
+	if got := fetcher.calls.Load(); got != 1 {
+		t.Errorf("fetches = %d, want 1", got)
+	}
+}
+
+// blockingFetcher waits for release, and tells started when a call begins.
+type blockingFetcher struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (b *blockingFetcher) Fetch(context.Context) error {
+	b.calls.Add(1)
+	b.started <- struct{}{}
+	<-b.release
+	return nil
+}
+
+func TestHandlerSameJTIWhileFetchRuns(t *testing.T) {
+	t.Parallel()
+
+	var logs strings.Builder
+	fetcher := &blockingFetcher{started: make(chan struct{}, 2), release: make(chan struct{})}
+	handler := newTestHandler(fetcher, &logs)
+	send := func() int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, hookPath, http.NoBody)
+		req.Header.Set("Authorization", "Bearer good")
+		got := httptest.NewRecorder()
+		handler.ServeHTTP(got, req)
+		return got.Code
+	}
+
+	first := make(chan int, 1)
+	go func() { first <- send() }()
+	<-fetcher.started
+
+	// The first request still waits for comin. A second one with the same jti
+	// must not start another call.
+	if got := send(); got != http.StatusConflict {
+		t.Errorf("status of the second request = %d, want %d", got, http.StatusConflict)
+	}
+	close(fetcher.release)
+	if got := <-first; got != http.StatusAccepted {
+		t.Errorf("status of the first request = %d, want %d", got, http.StatusAccepted)
+	}
+	if got := fetcher.calls.Load(); got != 1 {
+		t.Errorf("fetches = %d, want 1", got)
+	}
+}

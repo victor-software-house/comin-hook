@@ -137,7 +137,9 @@ func (h *Handler) handle(r *http.Request) result {
 		res.status, res.reason = http.StatusConflict, "replayed"
 		return res
 	}
-	if err := h.fetcher.Fetch(r.Context()); err != nil {
+	// The call keeps going when the client leaves. The jti stays reserved once
+	// comin got the call, so the call must not end with the request.
+	if err := h.fetcher.Fetch(context.WithoutCancel(r.Context())); err != nil {
 		h.replays.Release(id.ID)
 		res.status, res.reason, res.cause = http.StatusBadGateway, "fetch_failed", err
 		return res
