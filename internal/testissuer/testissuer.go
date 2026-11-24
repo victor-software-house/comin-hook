@@ -32,6 +32,7 @@ type Issuer struct {
 	Key *rsa.PrivateKey
 
 	jwksFetches atomic.Int32
+	jwksFailing atomic.Bool
 
 	mu         sync.Mutex
 	keys       map[string]*rsa.PublicKey
@@ -56,6 +57,10 @@ func New(tb testing.TB) *Issuer {
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		issuer.jwksFetches.Add(1)
+		if issuer.jwksFailing.Load() {
+			http.Error(w, "the key set is not available", http.StatusServiceUnavailable)
+			return
+		}
 		issuer.mu.Lock()
 		hook := issuer.onJWKSHook
 		issuer.mu.Unlock()
@@ -86,6 +91,19 @@ func (i *Issuer) Publish(kid string, key *rsa.PublicKey) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.keys[kid] = key
+}
+
+// Unpublish removes a key from the key set of the issuer, from now on.
+func (i *Issuer) Unpublish(kid string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	delete(i.keys, kid)
+}
+
+// FailJWKS makes the issuer answer each request for the key set with an error
+// while failing is true.
+func (i *Issuer) FailJWKS(failing bool) {
+	i.jwksFailing.Store(failing)
 }
 
 // OnJWKS sets a function that runs when a request for the key set arrives,

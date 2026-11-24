@@ -43,8 +43,8 @@ The receiver verifies the token itself, with the standard library.
    The `issuer` field must equal `--issuer` exactly, and `jwks_uri` must be an https URL.
 4. It loads the signature keys of type Rivest-Shamir-Adleman (RSA) from `jwks_uri`, and ignores the others.
    Each request has a 10 second timeout and a 1 MiB limit on the body.
-5. A `kid` that the receiver does not know makes it load the keys again, at most once a minute across all requests.
-   A known `kid` never loads them, and neither does a bad signature.
+5. A `kid` that the receiver does not know makes it load the keys again.
+   So does a verification after the loaded keys are an hour old.
 6. The signature is an RSA signature over the first two parts, with SHA-256.
 7. The claims must satisfy all of these:
    - `iss` equals `--issuer`.
@@ -52,6 +52,11 @@ The receiver verifies the token itself, with the standard library.
    - `exp` is present and in the future.
    - `nbf` and `iat`, when present, are at most 60 seconds in the future.
    - `jti` and `sub` are non-empty strings.
+
+The receiver loads the keys at most once a minute across all requests, and a bad signature never loads them.
+A key that the issuer dropped stops verifying within an hour.
+When the load of an old key set fails, the receiver keeps the old keys.
+An outage of the issuer then does not reject valid tokens.
 
 ## Threat model
 

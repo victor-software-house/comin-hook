@@ -289,6 +289,56 @@ func TestVerifyKeyFetches(t *testing.T) {
 	}
 }
 
+func TestVerifyKeySetAge(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	next := testissuer.NewKey(t)
+	oldToken := func() string { return f.issuer.Token(t, f.claims(nil)) }
+	nextToken := func() string {
+		return testissuer.SignWith(t, next,
+			map[string]any{"alg": "RS256", "typ": "JWT", "kid": "next"}, f.claims(nil))
+	}
+
+	// The issuer rotates: the first key goes away and a new one comes.
+	f.issuer.Publish("next", &next.PublicKey)
+	f.issuer.Unpublish(testissuer.KeyID)
+
+	steps := []struct {
+		name        string
+		advance     time.Duration
+		failing     bool
+		token       func() string
+		wantErr     bool
+		wantFetches int
+	}{
+		{name: "a young set serves the old key", advance: 59 * time.Minute, token: oldToken, wantFetches: 1},
+		{
+			name: "an old set whose reload fails keeps its keys", advance: 2 * time.Minute, failing: true,
+			token: oldToken, wantFetches: 2,
+		},
+		{name: "the failed reload waits out the minute", advance: 30 * time.Second, failing: true, token: oldToken, wantFetches: 2},
+		{
+			name: "after the minute the reload works and the dropped key stops verifying", advance: 31 * time.Second,
+			token: oldToken, wantErr: true, wantFetches: 3,
+		},
+		{name: "the new key verifies", token: nextToken, wantFetches: 3},
+		{name: "the set is young again", advance: 59 * time.Minute, token: nextToken, wantFetches: 3},
+		{name: "the next hour loads it again", advance: 2 * time.Minute, token: nextToken, wantFetches: 4},
+	}
+	for _, step := range steps {
+		f.clock.advance(step.advance)
+		f.issuer.FailJWKS(step.failing)
+		_, err := f.verifier.Verify(t.Context(), step.token())
+		if (err != nil) != step.wantErr {
+			t.Errorf("%s: error = %v, want error: %t", step.name, err, step.wantErr)
+		}
+		if got := f.issuer.JWKSFetches(); got != step.wantFetches {
+			t.Errorf("%s: fetches = %d, want %d", step.name, got, step.wantFetches)
+		}
+	}
+}
+
 func TestVerifyReloadSurvivesCanceledRequest(t *testing.T) {
 	t.Parallel()
 

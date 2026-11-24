@@ -41,8 +41,12 @@ const (
 	// maxTokenBytes bounds the length of a token.
 	maxTokenBytes = 8 << 10
 	// minRefetchInterval is the shortest time between two fetches of the key
-	// set that an unknown key ID causes.
+	// set, whatever causes them.
 	minRefetchInterval = time.Minute
+	// maxKeyAge is how long a loaded key set stays trusted. After that, the
+	// next verification loads it again, so a key that the issuer dropped stops
+	// verifying.
+	maxKeyAge = time.Hour
 	// timeLeeway is how far in the future an nbf or iat claim may be.
 	timeLeeway = time.Minute
 	// maxNumericDate bounds the seconds of a date claim, so that converting
@@ -76,14 +80,17 @@ type Verifier struct {
 	// mu guards the fields below. It is never held during a request.
 	mu        sync.Mutex
 	keys      map[string]*rsa.PublicKey
+	loadedAt  time.Time
 	lastFetch time.Time
 }
 
 // New discovers the issuer's configuration, loads its signing keys, and
 // returns a verifier that accepts RS256 tokens for audience.
 // ctx bounds only this start.
-// Afterwards, a token with an unknown key ID makes the verifier fetch the key
-// set again, at most once a minute across all requests.
+// Afterwards, the verifier fetches the key set again when a token has an
+// unknown key ID, and when the loaded set is an hour old.
+// It fetches at most once a minute across all requests.
+// When the fetch of an old set fails, it keeps the old keys.
 func New(ctx context.Context, issuer, audience string) (*Verifier, error) {
 	client := &http.Client{
 		Timeout: httpTimeout,
@@ -122,6 +129,7 @@ func newVerifier(
 	if v.keys, err = v.fetchKeys(ctx); err != nil {
 		return nil, fmt.Errorf("loading the keys of OIDC issuer %s: %w", issuer, err)
 	}
+	v.loadedAt = now()
 	return v, nil
 }
 
@@ -208,17 +216,25 @@ func (v *Verifier) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey, er
 	return keys, nil
 }
 
-// key returns the key with the given ID. An unknown ID makes it fetch the key
-// set again, unless a fetch ran within the last minute.
+// key returns the key with the given ID.
+// The key set is fetched again in two cases.
+// Either the ID is unknown, or the key set is older than maxKeyAge.
+// A fetch within the last minute blocks both.
+// For an old set, a failed or blocked fetch keeps the old keys.
+// An outage of the issuer then does not reject tokens that are still valid.
 func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	v.mu.Lock()
-	if key, ok := v.keys[kid]; ok {
-		v.mu.Unlock()
-		return key, nil
-	}
+	known, found := v.keys[kid]
 	now := v.now()
+	if found && now.Sub(v.loadedAt) < maxKeyAge {
+		v.mu.Unlock()
+		return known, nil
+	}
 	if !v.lastFetch.IsZero() && now.Sub(v.lastFetch) < minRefetchInterval {
 		v.mu.Unlock()
+		if found {
+			return known, nil
+		}
 		return nil, reject("unknown key id")
 	}
 	// Stamp the attempt before the request, so that concurrent requests and
@@ -230,11 +246,15 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	// it. The client of the verifier bounds it with its timeout.
 	keys, err := v.fetchKeys(context.WithoutCancel(ctx))
 	if err != nil {
+		if found {
+			return known, nil
+		}
 		return nil, fmt.Errorf("%w: fetching the keys: %w", ErrUnauthenticated, err)
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.keys = keys
+	v.loadedAt = v.now()
 	key, ok := keys[kid]
 	if !ok {
 		return nil, reject("unknown key id")
