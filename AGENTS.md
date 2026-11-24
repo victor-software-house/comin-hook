@@ -14,11 +14,16 @@ See [README.md](./README.md) for what it does and how to run it.
    One package per concept, named for its job, with no `util` package.
    `cmd/comin-hook` is the one composition root: `main` calls `run(ctx) error` and is the only caller of `os.Exit`.
    Wrap errors with `%w`.
-3. **No new dependency without a reason.**
-   Approve a module by adding it to the depguard `allow` list in the pull request that adds it to `go.mod`.
-4. **Tests are table tests compared with go-cmp.**
-5. **CI, tasks and hooks come from a shared template.**
+3. **The program links only the standard library and this module.**
+   It verifies the OIDC token and calls comin's gRPC method with `net/http` itself.
+   go-cmp is the one other module, for tests.
+   Approve a new module by adding it to the depguard `allow` list in the pull request that adds it to `go.mod`.
+4. **Funnel runs as a systemd unit.**
+   `comin-hook serve` is the only subcommand.
+   `nix/module.nix` runs `tailscale funnel` in `comin-hook-funnel.service`.
+5. **Tests are table tests compared with go-cmp.**
+6. **CI, tasks and hooks come from a shared template.**
    Change them through a template update, never by hand-writing a workflow.
-6. **Commits and pull requests.**
+7. **Commits and pull requests.**
    Conventional Commits, one pull request per change, branch names `<type>/<short-topic>`.
    CI verifies each push; run `mise run go:verify` where the machine guide allows builds.
