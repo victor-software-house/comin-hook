@@ -98,8 +98,12 @@ func (c *Client) Fetch(ctx context.Context) error {
 	// the body has ended.
 	status := resp.Header
 	if status.Get("Grpc-Status") == "" {
-		if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes)); err != nil {
+		read, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes+1))
+		if err != nil {
 			return fmt.Errorf("comin fetch: reading the reply: %w", err)
+		}
+		if read > maxResponseBytes {
+			return fmt.Errorf("comin fetch: the reply exceeds %d bytes", maxResponseBytes)
 		}
 		status = resp.Trailer
 	}

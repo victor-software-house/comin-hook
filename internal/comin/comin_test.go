@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -100,6 +101,8 @@ func TestFetch(t *testing.T) {
 		reply      func(http.ResponseWriter, *http.Request)
 		wantStatus *comin.StatusError
 		wantErr    bool
+		// wantMessage is a text that the error contains.
+		wantMessage string
 	}{
 		{name: "status 0 in the trailers", reply: replyWithTrailers("0", "")},
 		{
@@ -118,6 +121,33 @@ func TestFetch(t *testing.T) {
 			name: "no status",
 			reply: func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
+			},
+			wantErr: true,
+		},
+		{
+			name: "reply over the limit",
+			reply: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(make([]byte, 2<<20))
+				w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+			},
+			wantErr:     true,
+			wantMessage: "exceeds",
+		},
+		{
+			name:    "stream reset before the reply",
+			reply:   func(http.ResponseWriter, *http.Request) { panic(http.ErrAbortHandler) },
+			wantErr: true,
+		},
+		{
+			name: "stream reset during the reply",
+			reply: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte{0, 0, 0, 0, 0})
+				_ = http.NewResponseController(w).Flush()
+				panic(http.ErrAbortHandler)
 			},
 			wantErr: true,
 		},
@@ -146,6 +176,9 @@ func TestFetch(t *testing.T) {
 			err = client.Fetch(t.Context())
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("Fetch error = %v, want error: %t", err, tt.wantErr)
+			}
+			if tt.wantMessage != "" && !strings.Contains(err.Error(), tt.wantMessage) {
+				t.Errorf("Fetch error = %q, want one that contains %q", err, tt.wantMessage)
 			}
 			if tt.wantStatus != nil {
 				statusErr, ok := errors.AsType[*comin.StatusError](err)
