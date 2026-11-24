@@ -2,7 +2,10 @@ package verify
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -363,24 +366,107 @@ func TestNewChecksDiscovery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var issuerURL string
-			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/.well-known/openid-configuration" {
-					w.WriteHeader(tt.status)
-					_, _ = w.Write([]byte(tt.doc(issuerURL)))
-					return
-				}
-				if r.URL.Path == "/jwks" {
-					_, _ = w.Write([]byte(`{"keys":[]}`))
-					return
-				}
-				http.NotFound(w, r)
-			}))
-			t.Cleanup(srv.Close)
+			srv := serveIssuer(t, func() string { return tt.doc(issuerURL) }, tt.status, goodKeySet(t))
 			issuerURL = srv.URL
 
 			_, err := newVerifier(t.Context(), srv.URL, testAudience, srv.Client(), time.Now)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("newVerifier error = %v, want error: %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// goodKeySet returns a key set with one usable key.
+func goodKeySet(t *testing.T) string {
+	t.Helper()
+	return `{"keys":[` + keyEntry("k1", "RSA", testissuer.NewKey(t).N) + `]}`
+}
+
+// keyEntry returns a key set member with the exponent 65537.
+func keyEntry(kid, kty string, modulus *big.Int) string {
+	return fmt.Sprintf(`{"kty":%q,"use":"sig","kid":%q,"n":%q,"e":"AQAB"}`,
+		kty, kid, base64.RawURLEncoding.EncodeToString(modulus.Bytes()))
+}
+
+// serveIssuer serves a discovery document with the status given, and the key
+// set at /jwks, over TLS.
+func serveIssuer(t *testing.T, doc func() string, status int, jwks string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(doc()))
+		case "/jwks":
+			_, _ = w.Write([]byte(jwks))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestNewReadsKeySet(t *testing.T) {
+	t.Parallel()
+
+	key := testissuer.NewKey(t)
+	good := keyEntry("good", "RSA", key.N)
+	tests := []struct {
+		name     string
+		entries  []string
+		wantKids []string
+		wantErr  string
+	}{
+		{name: "one good key", entries: []string{good}, wantKids: []string{"good"}},
+		{
+			name:     "a bad entry beside a good one",
+			entries:  []string{`{"kty":"RSA","use":"sig","kid":"bad-n","n":"!!","e":"AQAB"}`, good},
+			wantKids: []string{"good"},
+		},
+		{
+			name:     "an exponent out of range beside a good key",
+			entries:  []string{`{"kty":"RSA","kid":"bad-e","n":"AQAB","e":"AA"}`, good},
+			wantKids: []string{"good"},
+		},
+		{
+			name:     "other types, uses and unnamed keys are skipped",
+			entries:  []string{keyEntry("ec", "EC", key.N), `{"kty":"RSA","use":"enc","kid":"enc","n":"AQAB","e":"AQAB"}`, `{"kty":"RSA","n":"AQAB","e":"AQAB"}`, good},
+			wantKids: []string{"good"},
+		},
+		{
+			name:    "only bad entries",
+			entries: []string{`{"kty":"RSA","use":"sig","kid":"bad-n","n":"!!","e":"AQAB"}`},
+			wantErr: "no usable RSA signature key",
+		},
+		{name: "no keys", entries: nil, wantErr: "no usable RSA signature key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var issuerURL string
+			srv := serveIssuer(t, func() string {
+				return `{"issuer":"` + issuerURL + `","jwks_uri":"` + issuerURL + `/jwks"}`
+			}, http.StatusOK, `{"keys":[`+strings.Join(tt.entries, ",")+`]}`)
+			issuerURL = srv.URL
+
+			v, err := newVerifier(t.Context(), srv.URL, testAudience, srv.Client(), time.Now)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("newVerifier error = %v, want one containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("newVerifier: %v", err)
+			}
+			var kids []string
+			for kid := range v.keys {
+				kids = append(kids, kid)
+			}
+			if diff := cmp.Diff(tt.wantKids, kids); diff != "" {
+				t.Errorf("key IDs mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

@@ -152,39 +152,58 @@ func (v *Verifier) getJSON(ctx context.Context, target string, out any) error {
 	return nil
 }
 
+// webKey is a key of a key set, with the members the verifier reads.
+type webKey struct {
+	Kty string `json:"kty"`
+	Use string `json:"use"`
+	Kid string `json:"kid"`
+	N   string `json:"n"`
+	E   string `json:"e"`
+}
+
+// publicKey decodes the public key of k.
+func (k webKey) publicKey() (*rsa.PublicKey, error) {
+	n, err := base64.RawURLEncoding.DecodeString(k.N)
+	if err != nil {
+		return nil, fmt.Errorf("decoding n: %w", err)
+	}
+	e, err := base64.RawURLEncoding.DecodeString(k.E)
+	if err != nil {
+		return nil, fmt.Errorf("decoding e: %w", err)
+	}
+	exponent := new(big.Int).SetBytes(e)
+	if !exponent.IsInt64() || exponent.Int64() < 2 || exponent.Int64() > math.MaxInt32 {
+		return nil, errors.New("the exponent is out of range")
+	}
+	return &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(exponent.Int64())}, nil
+}
+
 // fetchKeys returns the signature keys of the issuer by key ID.
-// It skips keys of another type or use.
+// It skips keys of another type or use, and keys that cannot be decoded, so
+// one bad entry does not block the others. It fails when no key is left.
 func (v *Verifier) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey, error) {
 	var set struct {
-		Keys []struct {
-			Kty string `json:"kty"`
-			Use string `json:"use"`
-			Kid string `json:"kid"`
-			N   string `json:"n"`
-			E   string `json:"e"`
-		} `json:"keys"`
+		Keys []webKey `json:"keys"`
 	}
 	if err := v.getJSON(ctx, v.jwksURL, &set); err != nil {
 		return nil, err
 	}
 	keys := make(map[string]*rsa.PublicKey, len(set.Keys))
+	var skipped []error
 	for _, k := range set.Keys {
 		if k.Kty != "RSA" || (k.Use != "sig" && k.Use != "") || k.Kid == "" {
 			continue
 		}
-		n, err := base64.RawURLEncoding.DecodeString(k.N)
+		key, err := k.publicKey()
 		if err != nil {
-			return nil, fmt.Errorf("key %q: decoding n: %w", k.Kid, err)
+			skipped = append(skipped, fmt.Errorf("key %q: %w", k.Kid, err))
+			continue
 		}
-		e, err := base64.RawURLEncoding.DecodeString(k.E)
-		if err != nil {
-			return nil, fmt.Errorf("key %q: decoding e: %w", k.Kid, err)
-		}
-		exponent := new(big.Int).SetBytes(e)
-		if !exponent.IsInt64() || exponent.Int64() < 2 || exponent.Int64() > math.MaxInt32 {
-			return nil, fmt.Errorf("key %q: the exponent is out of range", k.Kid)
-		}
-		keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: int(exponent.Int64())}
+		keys[k.Kid] = key
+	}
+	if len(keys) == 0 {
+		empty := errors.New("the key set has no usable RSA signature key")
+		return nil, errors.Join(append([]error{empty}, skipped...)...)
 	}
 	return keys, nil
 }
