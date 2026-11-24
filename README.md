@@ -126,7 +126,9 @@ The proxy target repeats the path, because tailscaled strips the mount point fro
 When the command returns, the unit checks `tailscale serve status --json`.
 It fails unless Funnel is on for the port and a proxy handler at the path points at the receiver.
 The check is needed because the tailscale CLI exits 0 without changing anything when the node lacks the funnel attribute.
-Stopping the unit runs `tailscale funnel --https=<port> --set-path=<path> off`.
+
+Stopping the unit runs `tailscale funnel --https=<port> --set-path=<path> off`, and ignores a failure of that command.
+A stop with tailscaled down, or with no handler left, therefore leaves no failed unit.
 
 Funnel needs HTTPS enabled for the tailnet and the `funnel` node attribute for the host.
 The public URL is `https://<node DNS name>:<funnel port><path>`, without the port part for 443.

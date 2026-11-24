@@ -258,14 +258,18 @@ in
           ++ [ funnelTarget ]
         );
         ExecStartPost = funnelCheck;
-        ExecStop = utils.escapeSystemdExecArgs (
-          [
-            tailscale
-            "funnel"
-          ]
-          ++ funnelArgs
-          ++ [ "off" ]
-        );
+        # "-" ignores a failure, so a stop with tailscaled down or with no
+        # handler left leaves no failed unit.
+        ExecStop =
+          "-"
+          + utils.escapeSystemdExecArgs (
+            [
+              tailscale
+              "funnel"
+            ]
+            ++ funnelArgs
+            ++ [ "off" ]
+          );
       };
     };
   };
