@@ -289,6 +289,28 @@ func TestVerifyKeyFetches(t *testing.T) {
 	}
 }
 
+func TestVerifyStaleSetWithoutUsableKey(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	f.clock.advance(maxKeyAge + maxStaleGrace + time.Minute)
+
+	// The issuer now publishes a set with no usable key.
+	// That counts as a failed load, so the old keys have no grace left.
+	f.issuer.Unpublish(testissuer.KeyID)
+	_, err := f.verifier.Verify(t.Context(), f.issuer.Token(t, f.claims(nil)))
+	if !errors.Is(err, ErrUnauthenticated) || !strings.Contains(err.Error(), "key set is stale") {
+		t.Errorf("Verify error = %v, want %v with a stale key set", err, ErrUnauthenticated)
+	}
+
+	// The issuer publishes the key again.
+	f.issuer.Publish(testissuer.KeyID, &f.issuer.Key.PublicKey)
+	f.clock.advance(time.Minute)
+	if _, err := f.verifier.Verify(t.Context(), f.issuer.Token(t, f.claims(nil))); err != nil {
+		t.Errorf("Verify after a good load: %v", err)
+	}
+}
+
 func TestVerifyKeySetAge(t *testing.T) {
 	t.Parallel()
 
@@ -310,6 +332,7 @@ func TestVerifyKeySetAge(t *testing.T) {
 		failing     bool
 		token       func() string
 		wantErr     bool
+		wantReason  string
 		wantFetches int
 	}{
 		{name: "a young set serves the old key", advance: 59 * time.Minute, token: oldToken, wantFetches: 1},
@@ -325,6 +348,19 @@ func TestVerifyKeySetAge(t *testing.T) {
 		{name: "the new key verifies", token: nextToken, wantFetches: 3},
 		{name: "the set is young again", advance: 59 * time.Minute, token: nextToken, wantFetches: 3},
 		{name: "the next hour loads it again", advance: 2 * time.Minute, token: nextToken, wantFetches: 4},
+		{
+			name: "a failed reload keeps the keys for a day", advance: 24*time.Hour + 59*time.Minute, failing: true,
+			token: nextToken, wantFetches: 5,
+		},
+		{
+			name: "after the day the set is stale and nothing verifies", advance: time.Hour, failing: true,
+			token: nextToken, wantErr: true, wantReason: "key set is stale", wantFetches: 6,
+		},
+		{
+			name: "the limit of one load a minute still applies", advance: 10 * time.Second, failing: true,
+			token: nextToken, wantErr: true, wantReason: "key set is stale", wantFetches: 6,
+		},
+		{name: "the first load that works restores service", advance: time.Minute, token: nextToken, wantFetches: 7},
 	}
 	for _, step := range steps {
 		f.clock.advance(step.advance)
@@ -332,6 +368,12 @@ func TestVerifyKeySetAge(t *testing.T) {
 		_, err := f.verifier.Verify(t.Context(), step.token())
 		if (err != nil) != step.wantErr {
 			t.Errorf("%s: error = %v, want error: %t", step.name, err, step.wantErr)
+		}
+		if err != nil && !errors.Is(err, ErrUnauthenticated) {
+			t.Errorf("%s: error = %v, want %v", step.name, err, ErrUnauthenticated)
+		}
+		if err != nil && !strings.Contains(err.Error(), step.wantReason) {
+			t.Errorf("%s: error = %q, want the reason %q", step.name, err, step.wantReason)
 		}
 		if got := f.issuer.JWKSFetches(); got != step.wantFetches {
 			t.Errorf("%s: fetches = %d, want %d", step.name, got, step.wantFetches)

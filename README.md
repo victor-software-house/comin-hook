@@ -55,8 +55,15 @@ The receiver verifies the token itself, with the standard library.
 
 The receiver loads the keys at most once a minute across all requests, and a bad signature never loads them.
 A key that the issuer dropped stops verifying within an hour.
-When the load of an old key set fails, the receiver keeps the old keys.
-An outage of the issuer then does not reject valid tokens.
+
+When the load of an old key set fails, the receiver keeps the old keys for 24 hours more.
+An outage of the issuer shorter than that does not reject valid tokens.
+
+After that, the key set is stale, and the receiver rejects every token with the reason `key set is stale`.
+Each request still tries the load again once a minute, and the first load that works restores service.
+
+A failed load costs speed and not a deploy, because comin polls its repository on its own.
+A key set with no usable key counts as a failed load.
 
 ## Threat model
 

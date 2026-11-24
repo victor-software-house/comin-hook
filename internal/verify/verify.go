@@ -47,6 +47,10 @@ const (
 	// next verification loads it again, so a key that the issuer dropped stops
 	// verifying.
 	maxKeyAge = time.Hour
+	// maxStaleGrace is how long past maxKeyAge a set that cannot be loaded
+	// again still serves. The receiver fails closed after that, which costs
+	// speed and not a deploy, since comin polls its repository on its own.
+	maxStaleGrace = 24 * time.Hour
 	// timeLeeway is how far in the future an nbf or iat claim may be.
 	timeLeeway = time.Minute
 	// maxNumericDate bounds the seconds of a date claim, so that converting
@@ -90,7 +94,8 @@ type Verifier struct {
 // Afterwards, the verifier fetches the key set again when a token has an
 // unknown key ID, and when the loaded set is an hour old.
 // It fetches at most once a minute across all requests.
-// When the fetch of an old set fails, it keeps the old keys.
+// When the fetch of an old set fails, it keeps the old keys for 24 hours more.
+// After that, it rejects every token until a fetch works.
 func New(ctx context.Context, issuer, audience string) (*Verifier, error) {
 	client := &http.Client{
 		Timeout: httpTimeout,
@@ -222,20 +227,21 @@ func (v *Verifier) fetchKeys(ctx context.Context) (map[string]*rsa.PublicKey, er
 // A fetch within the last minute blocks both.
 // For an old set, a failed or blocked fetch keeps the old keys.
 // An outage of the issuer then does not reject tokens that are still valid.
+// That holds for maxStaleGrace past maxKeyAge. After that, a set that could
+// not be loaded again is stale, and every token is rejected until a load works.
 func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	v.mu.Lock()
 	known, found := v.keys[kid]
 	now := v.now()
-	if found && now.Sub(v.loadedAt) < maxKeyAge {
+	age := now.Sub(v.loadedAt)
+	if found && age < maxKeyAge {
 		v.mu.Unlock()
 		return known, nil
 	}
+	stale := age >= maxKeyAge+maxStaleGrace
 	if !v.lastFetch.IsZero() && now.Sub(v.lastFetch) < minRefetchInterval {
 		v.mu.Unlock()
-		if found {
-			return known, nil
-		}
-		return nil, reject("unknown key id")
+		return v.withoutFetch(known, found, stale)
 	}
 	// Stamp the attempt before the request, so that concurrent requests and
 	// a failing issuer both wait out the interval.
@@ -246,8 +252,11 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	// it. The client of the verifier bounds it with its timeout.
 	keys, err := v.fetchKeys(context.WithoutCancel(ctx))
 	if err != nil {
-		if found {
-			return known, nil
+		if key, keyErr := v.withoutFetch(known, found, stale); keyErr == nil {
+			return key, nil
+		}
+		if stale {
+			return nil, fmt.Errorf("%w: key set is stale: fetching the keys: %w", ErrUnauthenticated, err)
 		}
 		return nil, fmt.Errorf("%w: fetching the keys: %w", ErrUnauthenticated, err)
 	}
@@ -260,6 +269,19 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 		return nil, reject("unknown key id")
 	}
 	return key, nil
+}
+
+// withoutFetch answers for a request that has no fresh key set.
+// An old set serves its known keys until it is stale.
+func (v *Verifier) withoutFetch(known *rsa.PublicKey, found, stale bool) (*rsa.PublicKey, error) {
+	switch {
+	case stale:
+		return nil, reject("key set is stale")
+	case found:
+		return known, nil
+	default:
+		return nil, reject("unknown key id")
+	}
 }
 
 // reject returns an error wrapping ErrUnauthenticated.
