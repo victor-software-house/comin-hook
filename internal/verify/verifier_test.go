@@ -1,6 +1,7 @@
 package verify
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -136,6 +137,7 @@ func TestVerify(t *testing.T) {
 		{name: "empty jti", mutate: func(c map[string]any) { c["jti"] = "" }, wantErr: ErrUnauthenticated},
 		{name: "sub is a number", mutate: func(c map[string]any) { c["sub"] = 7 }, wantErr: ErrUnauthenticated},
 		{name: "no sub", mutate: func(c map[string]any) { delete(c, "sub") }, wantErr: ErrUnauthenticated},
+		{name: "empty sub", mutate: func(c map[string]any) { c["sub"] = "" }, wantErr: ErrUnauthenticated},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -168,30 +170,56 @@ func TestVerifyRejectsTokenForm(t *testing.T) {
 	}
 	valid := f.issuer.Token(t, claims)
 
+	const (
+		reasonAlg      = "token algorithm is not RS256"
+		reasonKid      = "token has no key id"
+		reasonParts    = "token is not three parts"
+		reasonObject   = "token payload is not a JSON object"
+		reasonHeader   = "token header is not valid JSON"
+		reasonLong     = "token is too long"
+		reasonB64Head  = "token header is not base64url"
+		reasonB64Sig   = "token signature is not base64url"
+		duplicateClaim = `{"iss":"x","sub":"a","sub":"b","jti":"j","exp":4000000000}`
+	)
 	tests := []struct {
-		name string
-		raw  string
+		name       string
+		raw        string
+		wantReason string
 	}{
-		{name: "alg none", raw: testissuer.SignWith(t, f.issuer.Key, header("none", testissuer.KeyID), claims)},
-		{name: "alg HS256", raw: testissuer.SignWith(t, f.issuer.Key, header("HS256", testissuer.KeyID), claims)},
-		{name: "alg RS512", raw: testissuer.SignWith(t, f.issuer.Key, header("RS512", testissuer.KeyID), claims)},
-		{name: "alg in lower case", raw: testissuer.SignWith(t, f.issuer.Key, header("rs256", testissuer.KeyID), claims)},
-		{name: "no alg", raw: testissuer.SignWith(t, f.issuer.Key, header(nil, testissuer.KeyID), claims)},
-		{name: "no kid", raw: testissuer.SignWith(t, f.issuer.Key, header("RS256", nil), claims)},
-		{name: "empty kid", raw: testissuer.SignWith(t, f.issuer.Key, header("RS256", ""), claims)},
-		{name: "empty", raw: ""},
-		{name: "two parts", raw: valid[:strings.LastIndex(valid, ".")]},
-		{name: "four parts", raw: valid + ".extra"},
-		{name: "padded signature", raw: valid + "="},
-		{name: "not base64url", raw: "a+b.c/d.e"},
-		{name: "header is not JSON", raw: "bm90LWpzb24.bm90LWpzb24.c2ln"},
-		{name: "too long", raw: valid + strings.Repeat("A", maxTokenBytes)},
+		{name: "alg none", raw: testissuer.SignWith(t, f.issuer.Key, header("none", testissuer.KeyID), claims), wantReason: reasonAlg},
+		{name: "alg HS256", raw: testissuer.SignWith(t, f.issuer.Key, header("HS256", testissuer.KeyID), claims), wantReason: reasonAlg},
+		{name: "alg RS512", raw: testissuer.SignWith(t, f.issuer.Key, header("RS512", testissuer.KeyID), claims), wantReason: reasonAlg},
+		{name: "alg in lower case", raw: testissuer.SignWith(t, f.issuer.Key, header("rs256", testissuer.KeyID), claims), wantReason: reasonAlg},
+		{name: "no alg", raw: testissuer.SignWith(t, f.issuer.Key, header(nil, testissuer.KeyID), claims), wantReason: reasonAlg},
+		{name: "no kid", raw: testissuer.SignWith(t, f.issuer.Key, header("RS256", nil), claims), wantReason: reasonKid},
+		{name: "empty kid", raw: testissuer.SignWith(t, f.issuer.Key, header("RS256", ""), claims), wantReason: reasonKid},
+		{name: "empty", raw: "", wantReason: reasonParts},
+		{name: "two parts", raw: valid[:strings.LastIndex(valid, ".")], wantReason: reasonParts},
+		{name: "four parts", raw: valid + ".extra", wantReason: reasonParts},
+		{name: "padded signature", raw: valid + "=", wantReason: reasonB64Sig},
+		{name: "not base64url", raw: "a+b.c/d.e", wantReason: reasonB64Head},
+		{name: "header is not JSON", raw: "bm90LWpzb24.bm90LWpzb24.c2ln", wantReason: reasonHeader},
+		{name: "too long", raw: valid + strings.Repeat("A", maxTokenBytes), wantReason: reasonLong},
+		{
+			name:       "a claim name repeated",
+			raw:        testissuer.SignRaw(t, f.issuer.Key, `{"alg":"RS256","kid":"`+testissuer.KeyID+`"}`, duplicateClaim),
+			wantReason: reasonObject,
+		},
+		{
+			name:       "a header member repeated",
+			raw:        testissuer.SignRaw(t, f.issuer.Key, `{"alg":"RS256","alg":"none","kid":"`+testissuer.KeyID+`"}`, `{}`),
+			wantReason: reasonHeader,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := f.verifier.Verify(t.Context(), tt.raw); !errors.Is(err, ErrUnauthenticated) {
-				t.Errorf("Verify error = %v, want %v", err, ErrUnauthenticated)
+			_, err := f.verifier.Verify(t.Context(), tt.raw)
+			if !errors.Is(err, ErrUnauthenticated) {
+				t.Fatalf("Verify error = %v, want %v", err, ErrUnauthenticated)
+			}
+			if !strings.Contains(err.Error(), tt.wantReason) {
+				t.Errorf("Verify error = %q, want the reason %q", err, tt.wantReason)
 			}
 		})
 	}
@@ -255,6 +283,33 @@ func TestVerifyKeyFetches(t *testing.T) {
 		if got := f.issuer.JWKSFetches(); got != step.wantFetches {
 			t.Errorf("%s: fetches = %d, want %d", step.name, got, step.wantFetches)
 		}
+	}
+}
+
+func TestVerifyReloadSurvivesCanceledRequest(t *testing.T) {
+	t.Parallel()
+
+	f := newFixture(t)
+	rotated := testissuer.NewKey(t)
+	f.issuer.Publish("rotated", &rotated.PublicKey)
+	token := testissuer.SignWith(t, rotated,
+		map[string]any{"alg": "RS256", "typ": "JWT", "kid": "rotated"}, f.claims(nil))
+
+	// The client leaves while the issuer receives the request for the key set.
+	ctx, cancel := context.WithCancel(t.Context())
+	f.issuer.OnJWKS(cancel)
+	if _, err := f.verifier.Verify(ctx, token); err != nil {
+		t.Errorf("Verify with a request that ended during the reload: %v", err)
+	}
+	f.issuer.OnJWKS(nil)
+
+	// The keys loaded in spite of that, and the interval allows no new fetch.
+	f.clock.advance(time.Second)
+	if _, err := f.verifier.Verify(t.Context(), token); err != nil {
+		t.Errorf("Verify after the reload: %v", err)
+	}
+	if got := f.issuer.JWKSFetches(); got != 2 {
+		t.Errorf("key set fetches = %d, want 2: the start and one reload", got)
 	}
 }
 

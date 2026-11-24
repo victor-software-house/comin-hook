@@ -207,7 +207,9 @@ func (v *Verifier) key(ctx context.Context, kid string) (*rsa.PublicKey, error) 
 	v.lastFetch = now
 	v.mu.Unlock()
 
-	keys, err := v.fetchKeys(ctx)
+	// The reload serves every request, so a client that leaves must not cancel
+	// it. The client of the verifier bounds it with its timeout.
+	keys, err := v.fetchKeys(context.WithoutCancel(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("%w: fetching the keys: %w", ErrUnauthenticated, err)
 	}
@@ -343,6 +345,9 @@ func (v *Verifier) checkClaims(claims map[string]any, now time.Time) (Identity, 
 	subject, ok := claims["sub"].(string)
 	if !ok {
 		return Identity{}, reject("sub is not a string")
+	}
+	if subject == "" {
+		return Identity{}, reject("sub is empty")
 	}
 	return Identity{Subject: subject, ID: id, Expiry: expiry, Claims: claims}, nil
 }

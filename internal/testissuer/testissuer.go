@@ -33,8 +33,9 @@ type Issuer struct {
 
 	jwksFetches atomic.Int32
 
-	mu   sync.Mutex
-	keys map[string]*rsa.PublicKey
+	mu         sync.Mutex
+	keys       map[string]*rsa.PublicKey
+	onJWKSHook func()
 }
 
 // New starts an issuer that lives until the test ends.
@@ -55,6 +56,12 @@ func New(tb testing.TB) *Issuer {
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
 		issuer.jwksFetches.Add(1)
+		issuer.mu.Lock()
+		hook := issuer.onJWKSHook
+		issuer.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		writeJSON(w, issuer.keySet())
 	})
 	srv := httptest.NewTLSServer(mux)
@@ -81,6 +88,14 @@ func (i *Issuer) Publish(kid string, key *rsa.PublicKey) {
 	i.keys[kid] = key
 }
 
+// OnJWKS sets a function that runs when a request for the key set arrives,
+// before the issuer answers it.
+func (i *Issuer) OnJWKS(hook func()) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.onJWKSHook = hook
+}
+
 // JWKSFetches is the number of times the key set was fetched so far.
 func (i *Issuer) JWKSFetches() int {
 	return int(i.jwksFetches.Load())
@@ -104,6 +119,21 @@ func (i *Issuer) Sign(tb testing.TB, key *rsa.PrivateKey, claims map[string]any)
 func SignWith(tb testing.TB, key *rsa.PrivateKey, header, claims map[string]any) string {
 	tb.Helper()
 	input := encodePart(tb, header) + "." + encodePart(tb, claims)
+	digest := sha256.Sum256([]byte(input))
+	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
+	if err != nil {
+		tb.Fatalf("signing the token: %v", err)
+	}
+	return input + "." + base64.RawURLEncoding.EncodeToString(signature)
+}
+
+// SignRaw signs the given header and payload texts as they are, so a test can
+// build a token whose JSON is malformed or repeats a member name.
+// The signature uses SHA-256.
+func SignRaw(tb testing.TB, key *rsa.PrivateKey, header, payload string) string {
+	tb.Helper()
+	input := base64.RawURLEncoding.EncodeToString([]byte(header)) + "." +
+		base64.RawURLEncoding.EncodeToString([]byte(payload))
 	digest := sha256.Sum256([]byte(input))
 	signature, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest[:])
 	if err != nil {
